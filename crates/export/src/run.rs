@@ -73,15 +73,24 @@ fn capped_pool(max_threads: u32) -> Option<rayon::ThreadPool> {
 /// once it is complete, so a failed or cancelled export leaves any earlier file at that path as it
 /// was (#2793).
 pub fn export(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, sources: &dyn SourceProvider, progress: &Progress) -> Result<Report> {
-    let Some(staged) = staging_path(settings) else { return export_pooled(project, seq, settings, sources, progress) };
+    let Some((staged, file)) = reserve_staging(settings)? else { return export_pooled(project, seq, settings, sources, progress) };
     let mut staging = settings.clone();
     staging.path = staged.clone();
-    match export_pooled(project, seq, &staging, sources, progress) {
+    staging.output_file = Some(Arc::new(file));
+    progress.staged.store(true, Ordering::Relaxed);
+    let result = export_pooled(project, seq, &staging, sources, progress);
+    progress.staged.store(false, Ordering::Relaxed);
+    // the reserved file is closed before it is renamed or removed (Windows can't rename it open)
+    drop(staging);
+    match result {
         Ok(mut report) => {
             if let Err(e) = std::fs::rename(&staged, &settings.path) {
                 return Err(ExportError::Io(format!("{}: {e} (the finished export is in {staged})", settings.path)));
             }
             report.path = settings.path.clone();
+            if !settings.part_of_batch {
+                progress.set_done(report.seconds);
+            }
             Ok(report)
         }
         Err(e) => {
@@ -91,25 +100,36 @@ pub fn export(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, so
     }
 }
 
-/// Where an export to one file on disk is rendered before it takes the destination's name: a hidden
-/// file next to it, with the same extension (the AAC writer chooses ADTS by it). None when the output
-/// goes to a sink or an already opened file, or is several files (image sequences, MXF OP-Atom).
-fn staging_path(settings: &ExportSettings) -> Option<String> {
+/// Reserve the file an export to one file on disk is rendered to before it takes the destination's
+/// name: a new hidden file next to it, with the same extension (the AAC writer chooses ADTS by it),
+/// created exclusively so two exports to one destination never share it and no other file is
+/// truncated. None when the output goes to a sink or an already reserved file, or is several files
+/// (image sequences, MXF OP-Atom).
+fn reserve_staging(settings: &ExportSettings) -> Result<Option<(String, std::fs::File)>> {
     if cfg!(target_arch = "wasm32")
         || settings.sink.is_some()
         || settings.output_file.is_some()
         || settings.format.is_image_sequence()
         || settings.format == Format::MxfOpAtom
     {
-        return None;
+        return Ok(None);
     }
     let path = std::path::Path::new(&settings.path);
-    let name = path.file_name()?.to_str()?;
-    let staged = match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() => format!(".{stem}.part.{ext}"),
-        _ => format!(".{name}.part"),
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return Ok(None) };
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem, format!(".{ext}")),
+        _ => (name, String::new()),
     };
-    Some(path.with_file_name(staged).to_string_lossy().into_owned())
+    for n in 0..64u32 {
+        let tag = if n == 0 { String::new() } else { n.to_string() };
+        let staged = path.with_file_name(format!(".{stem}.part{tag}{ext}")).to_string_lossy().into_owned();
+        match std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&staged) {
+            Ok(file) => return Ok(Some((staged, file))),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(ExportError::Io(format!("{staged}: {e}"))),
+        }
+    }
+    Err(ExportError::Io(format!("{}: too many unfinished exports beside it (.{stem}.part*{ext})", settings.path)))
 }
 
 fn export_pooled(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, sources: &dyn SourceProvider, progress: &Progress) -> Result<Report> {
@@ -274,8 +294,7 @@ fn export_here(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, s
     };
     let secs = t0.elapsed().as_secs_f64();
     if !settings.part_of_batch {
-        progress.finished.store(true, Ordering::Relaxed);
-        progress.set_status(format!("Done in {secs:.1}s"));
+        progress.set_done(secs);
     }
     Ok(Report { path: settings.path.clone(), frames: nframes, seconds: secs, bytes, render_fps: nframes as f64 / secs.max(1e-6), extra_files: Vec::new() })
 }

@@ -483,11 +483,12 @@ pub fn spawn_export(s: &mut Session, project: Arc<Project>, seq: ItemId, mut set
         let services = s.services.clone();
         settings.sink = Some(filmcraft_export::OutputSink(Arc::new(move |path: &str, data: Vec<u8>| services.write_file(path, &data))));
     }
+    // A queued item renders a snapshot of the project: media imported since then counts too.
     if !s.services.export_in_memory()
-        && let Some(name) = media_at(&project, &settings.path)
+        && let Some(name) = media_at(&project, &settings).or_else(|| media_at(&s.project, &settings))
     {
         return Err(EngineError::Other(format!(
-            "{} is the media of “{name}” in this project; exporting over it would destroy footage the export reads. Choose another file.",
+            "exporting to {} would write over the media of “{name}” in this project, footage the export reads. Choose another file.",
             settings.path
         )));
     }
@@ -528,14 +529,33 @@ pub fn spawn_export(s: &mut Session, project: Arc<Project>, seq: ItemId, mut set
     Ok(id)
 }
 
-/// The name of the project item whose media or proxy file is `path`, if any (#2793). A path that
-/// doesn't exist yet is nobody's media.
-fn media_at(project: &Project, path: &str) -> Option<String> {
-    let target = std::fs::canonicalize(path).ok()?;
+/// The name of the project item whose media or proxy file the export would write over, if any
+/// (#2793): the destination itself, or for image sequences and MXF OP-Atom the numbered frames and
+/// `_A<n>` audio files written beside it ([`filmcraft_export::image_sequence_path`],
+/// [`filmcraft_export::opatom_audio_paths`]). Paths are compared canonically.
+fn media_at(project: &Project, settings: &ExportSettings) -> Option<String> {
+    let dest = Path::new(&settings.path);
+    let dir = std::fs::canonicalize(dest.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."))).ok()?;
+    let target = std::fs::canonicalize(dest).ok();
+    let stem = dest.file_stem()?.to_str()?;
+    let ext = dest.extension().and_then(|e| e.to_str()).unwrap_or("png");
+    let digits = |n: &str, min: usize| n.len() >= min && n.bytes().all(|b| b.is_ascii_digit());
+    let written = |file: &Path| {
+        if target.as_deref() == Some(file) {
+            return true;
+        }
+        let Some(name) = file.file_name().and_then(|n| n.to_str()).filter(|_| file.parent() == Some(dir.as_path())) else { return false };
+        let rest = name.strip_prefix(stem);
+        match settings.format {
+            f if f.is_image_sequence() => rest.and_then(|r| r.strip_suffix(ext)?.strip_suffix('.')).is_some_and(|n| digits(n, 3)),
+            Format::MxfOpAtom => rest.and_then(|r| r.strip_prefix("_A")?.strip_suffix(".mxf")).is_some_and(|n| digits(n, 1)),
+            _ => false,
+        }
+    };
     project.items.values().find_map(|item| {
         let ItemKind::Media(m) = &item.kind else { return None };
         let mut files = std::iter::once(&m.media).chain(m.proxy.as_ref());
-        files.any(|f| matches!(f, MediaRef::File { path } if std::fs::canonicalize(path).is_ok_and(|p| p == target))).then(|| item.name.clone())
+        files.any(|f| matches!(f, MediaRef::File { path } if std::fs::canonicalize(path).is_ok_and(|p| written(&p)))).then(|| item.name.clone())
     })
 }
 

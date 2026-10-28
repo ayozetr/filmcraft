@@ -82,6 +82,7 @@ fn mjpeg_mov_roundtrip() {
 fn an_export_replaces_its_destination_only_once_complete() {
     let (p, seq, m) = project();
     let dir = std::path::PathBuf::from(tmp("staged-2793"));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("out.mov").to_string_lossy().to_string();
     std::fs::write(&path, b"earlier export").unwrap();
@@ -101,12 +102,31 @@ fn an_export_replaces_its_destination_only_once_complete() {
     assert!(std::fs::read(&path).unwrap() == b"earlier export", "the cancelled export changed the earlier file");
     assert_eq!(files(), ["out.mov"]);
 
-    let r = export(&p, seq, &s, &m, &Progress::default()).unwrap();
+    // finished only once the destination is the new file (the UI and Quick Export read it so)
+    let done = Progress::default();
+    let r = std::thread::scope(|t| {
+        let job = t.spawn(|| export(&p, seq, &s, &m, &done));
+        while !done.finished.load(Ordering::Relaxed) && !job.is_finished() {
+            std::thread::yield_now();
+        }
+        assert!(std::fs::read(&path).unwrap() != b"earlier export", "finished before the export took the destination's name");
+        job.join().unwrap().unwrap()
+    });
+    assert!(done.finished.load(Ordering::Relaxed));
     assert_eq!(r.path, path);
     let bytes = std::fs::read(&path).unwrap();
     assert_eq!(bytes.len() as u64, r.bytes);
     assert!(bytes != b"earlier export", "the finished export did not replace the earlier file");
     assert_eq!(files(), ["out.mov"]);
+
+    // a staging file another export holds is left alone: this one reserves the next name
+    std::fs::write(dir.join(".out.part.mov"), b"another export").unwrap();
+    export(&p, seq, &s, &m, &Progress::default()).unwrap();
+    assert!(std::fs::read(dir.join(".out.part.mov")).unwrap() == b"another export", "the other staging file was truncated");
+    let mut left = files();
+    left.sort();
+    assert_eq!(left, [".out.part.mov", "out.mov"]);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

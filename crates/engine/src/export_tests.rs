@@ -84,11 +84,38 @@ fn an_export_over_the_projects_own_media_is_refused() {
     let respelled = Path::new(&dir.path(".")).join("clip.wav").to_string_lossy().to_string();
     for path in [clip.as_str(), respelled.as_str()] {
         let e = s.execute("file.exportMedia", with_path(path)).unwrap_err().to_string();
-        assert!(e.contains("media of"), "{path}: {e}");
+        assert!(e.contains("media of “clip.wav”"), "{path}: {e}");
     }
     assert!(std::fs::read(&clip).unwrap() == before, "the media file changed");
     // another file in the same folder still exports
     s.execute("file.exportMedia", with_path(&dir.path("other.wav"))).unwrap();
+
+    // a queued export is checked against the project as it is when the item starts, not only
+    // against the snapshot it renders
+    let later = dir.path("later.wav");
+    s.execute("file.exportMedia", with_path(&later)).unwrap();
+    let mut queued = with_path(&later);
+    queued.as_object_mut().unwrap().remove("wait");
+    s.execute("export.queue.add", queued).unwrap();
+    s.execute("file.import", json!({"paths": [later]})).unwrap();
+    let before = std::fs::read(&later).unwrap();
+    s.execute("export.queue.start", json!({"wait": true})).unwrap();
+    let item = queue(&mut s).into_iter().next().unwrap();
+    assert_eq!(item["status"], json!("failed"), "{item}");
+    assert!(item["error"].as_str().unwrap().contains("media of"), "{item}");
+    assert!(std::fs::read(&later).unwrap() == before, "the queued export changed the media file");
+
+    // an image sequence is refused when one of the frames it would write is media
+    let mut frames = range.clone();
+    frames["format"] = json!("png");
+    frames["path"] = json!(dir.path("shot.png"));
+    s.execute("file.exportMedia", frames.clone()).unwrap();
+    let frame = dir.path("shot001.png");
+    s.execute("file.import", json!({"paths": [frame]})).unwrap();
+    let before = std::fs::read(&frame).unwrap();
+    let e = s.execute("file.exportMedia", frames).unwrap_err().to_string();
+    assert!(e.contains("media of"), "{e}");
+    assert!(std::fs::read(&frame).unwrap() == before, "the frame changed");
 }
 
 /// A scratch directory under the workspace `target/`, removed when dropped.
