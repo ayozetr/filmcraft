@@ -87,9 +87,19 @@ fn prune_empty_dirs_at(dir: &Path, keep: Option<&Path>, depth: usize) {
     }
 }
 
+/// Whether `dir` may be cleaned: a real folder, not a symlink or junction to one. The cache
+/// folder's name inside a custom location is known, so someone who can write to that location
+/// could put a link there to a folder of the user's, and cleaning would delete what's in it.
+fn cleanable(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_dir())
+}
+
 /// Media Cache Management: apply the automatic deletion policy to `dir` at `now`, never touching
-/// `keep` (the open project's files). Returns (files, bytes) removed.
+/// `keep` (the open project's files). Returns (files, bytes) removed; nothing when `dir` is a link.
 pub fn enforce_policy(dir: &Path, prefs: &MediaCachePrefs, keep: Option<&Path>, now: std::time::SystemTime) -> (usize, u64) {
+    if !cleanable(dir) {
+        return (0, 0);
+    }
     let mut files = cache_files(dir);
     let removed = match prefs.management.as_str() {
         "olderThan" => {
@@ -120,8 +130,12 @@ pub fn enforce_policy(dir: &Path, prefs: &MediaCachePrefs, keep: Option<&Path>, 
     removed
 }
 
-/// Delete everything in the media cache except `keep` ("Delete…" ▸ unused files).
+/// Delete everything in the media cache except `keep` ("Delete…" ▸ unused files); nothing when
+/// `dir` is a link.
 pub fn clean(dir: &Path, keep: Option<&Path>) -> (usize, u64) {
+    if !cleanable(dir) {
+        return (0, 0);
+    }
     let files = cache_files(dir);
     let r = remove_files(&files, keep);
     prune_empty_dirs(dir, keep);

@@ -480,7 +480,7 @@ fn media_cache_location_policy_and_clean() {
 
 /// #2772: a custom media cache location is a folder the user picked (the home folder, a footage
 /// folder), so the policy and "Delete…" work in a folder of FilmCraft's own inside it and leave
-/// everything else alone, and empty-folder pruning doesn't follow symlinks out of the cache.
+/// everything else alone; neither a symlink inside the cache nor one in place of it is followed.
 #[test]
 fn media_cache_cleaning_keeps_the_files_of_the_chosen_folder() {
     let dir = tmp_dir("prefs-cache-keep");
@@ -515,6 +515,16 @@ fn media_cache_cleaning_keeps_the_files_of_the_chosen_folder() {
         let p = settings::MediaCachePrefs { management: "olderThan".into(), older_than_days: 5, ..Default::default() };
         settings::enforce_policy(&cache, &p, None, std::time::SystemTime::now());
         assert!(outside.exists(), "pruning followed a symlink out of the cache");
+        // A link in place of the cache folder itself, to a folder of the user's: nothing in it goes.
+        std::fs::remove_dir_all(&cache).unwrap();
+        let documents = dir.join("Documents");
+        std::fs::create_dir_all(documents.join("drafts")).unwrap();
+        std::fs::write(documents.join("letter.txt"), b"mine").unwrap();
+        std::os::unix::fs::symlink(&documents, &cache).unwrap();
+        let p = settings::MediaCachePrefs { management: "olderThan".into(), older_than_days: 0, ..Default::default() };
+        assert_eq!(settings::enforce_policy(&cache, &p, None, std::time::SystemTime::now()), (0, 0));
+        s.execute("mediaCache.clean", json!({"all": true})).unwrap();
+        assert!(documents.join("letter.txt").exists() && documents.join("drafts").exists(), "cleaning followed a linked cache folder");
     }
     s.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
