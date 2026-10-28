@@ -27,7 +27,7 @@ use std::sync::atomic::Ordering;
 
 use filmcraft_export::presets::{DEFAULT_PRESET, preset_key};
 use filmcraft_export::{BitrateMode, ExportPreset, ExportSettings, Format, GpuRendering, HardwareEncoding};
-use filmcraft_project::{ItemId, Project};
+use filmcraft_project::{ItemId, ItemKind, MediaRef, Project};
 use filmcraft_time::{FrameRate, Tick, TimeRange};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -483,6 +483,14 @@ pub fn spawn_export(s: &mut Session, project: Arc<Project>, seq: ItemId, mut set
         let services = s.services.clone();
         settings.sink = Some(filmcraft_export::OutputSink(Arc::new(move |path: &str, data: Vec<u8>| services.write_file(path, &data))));
     }
+    if !s.services.export_in_memory()
+        && let Some(name) = media_at(&project, &settings.path)
+    {
+        return Err(EngineError::Other(format!(
+            "{} is the media of “{name}” in this project; exporting over it would destroy footage the export reads. Choose another file.",
+            settings.path
+        )));
+    }
     if let Some(dir) = Path::new(&settings.path).parent().filter(|d| !d.as_os_str().is_empty() && !s.services.export_in_memory()) {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -518,6 +526,17 @@ pub fn spawn_export(s: &mut Session, project: Arc<Project>, seq: ItemId, mut set
         std::thread::Builder::new().name("filmcraft-export".into()).spawn(run).map_err(|e| EngineError::Other(e.to_string()))?;
     }
     Ok(id)
+}
+
+/// The name of the project item whose media or proxy file is `path`, if any (#2793). A path that
+/// doesn't exist yet is nobody's media.
+fn media_at(project: &Project, path: &str) -> Option<String> {
+    let target = std::fs::canonicalize(path).ok()?;
+    project.items.values().find_map(|item| {
+        let ItemKind::Media(m) = &item.kind else { return None };
+        let mut files = std::iter::once(&m.media).chain(m.proxy.as_ref());
+        files.any(|f| matches!(f, MediaRef::File { path } if std::fs::canonicalize(path).is_ok_and(|p| p == target))).then(|| item.name.clone())
+    })
 }
 
 /// Last-resort guard for a background job body (export, previews, proxies, …): a panic marks the

@@ -65,6 +65,32 @@ fn export_without_wait_says_where_to_poll() {
     assert!(r.get("poll").is_none() && r["result"].is_object(), "{r}");
 }
 
+/// #2793: an export over a file the project uses as media is refused, however its path is
+/// spelled, and the file is left as it was (the export would read the footage it overwrites).
+#[test]
+fn an_export_over_the_projects_own_media_is_refused() {
+    let mut s = demo();
+    let dir = Scratch::new("own-media");
+    let clip = dir.path("clip.wav");
+    let range = json!({"format": "wav", "range": "custom", "startSeconds": 0, "endSeconds": 0.25, "wait": true});
+    let with_path = |path: &str| {
+        let mut p = range.clone();
+        p["path"] = json!(path);
+        p
+    };
+    s.execute("file.exportMedia", with_path(&clip)).unwrap();
+    s.execute("file.import", json!({"paths": [clip]})).unwrap();
+    let before = std::fs::read(&clip).unwrap();
+    let respelled = Path::new(&dir.path(".")).join("clip.wav").to_string_lossy().to_string();
+    for path in [clip.as_str(), respelled.as_str()] {
+        let e = s.execute("file.exportMedia", with_path(path)).unwrap_err().to_string();
+        assert!(e.contains("media of"), "{path}: {e}");
+    }
+    assert!(std::fs::read(&clip).unwrap() == before, "the media file changed");
+    // another file in the same folder still exports
+    s.execute("file.exportMedia", with_path(&dir.path("other.wav"))).unwrap();
+}
+
 /// A scratch directory under the workspace `target/`, removed when dropped.
 struct Scratch(PathBuf);
 
