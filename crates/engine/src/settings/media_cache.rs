@@ -3,10 +3,16 @@ use super::*;
 
 // ------------------------------------------------------------------ media cache
 
-/// The media cache folder: the configured location, else `<data dir>/Media Cache`.
+/// The folder FilmCraft makes inside a custom media cache location.
+pub const CUSTOM_CACHE_FOLDER: &str = "FilmCraft Media Cache";
+
+/// The media cache folder: a folder of its own inside the configured location (as Premiere keeps
+/// its cache in a dedicated subfolder), else `<data dir>/Media Cache`. The cache policy and
+/// "Delete…" remove every file in this folder, so it must never be a folder the user chose: a
+/// location like the home folder or a footage folder would lose unrelated files (#2772).
 pub fn media_cache_dir(prefs: &MediaCachePrefs, data_dir: Option<&Path>) -> Option<PathBuf> {
     if !prefs.location.trim().is_empty() {
-        return Some(PathBuf::from(prefs.location.trim()));
+        return Some(PathBuf::from(prefs.location.trim()).join(CUSTOM_CACHE_FOLDER));
     }
     data_dir.map(|d| d.join("Media Cache"))
 }
@@ -55,15 +61,28 @@ fn remove_files(files: &[(PathBuf, u64, std::time::SystemTime)], keep: Option<&P
     n
 }
 
+/// Deepest folder level `prune_empty_dirs` descends to.
+const MAX_PRUNE_DEPTH: usize = 64;
+
+/// Remove empty folders under `dir`, except `keep` and its parents. A symlink or junction is never
+/// followed: `DirEntry::file_type` doesn't traverse it, where `Path::is_dir` would (#2772).
 fn prune_empty_dirs(dir: &Path, keep: Option<&Path>) {
+    prune_empty_dirs_at(dir, keep, 0);
+}
+
+fn prune_empty_dirs_at(dir: &Path, keep: Option<&Path>, depth: usize) {
+    if depth >= MAX_PRUNE_DEPTH {
+        return;
+    }
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
+        if !e.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
         let p = e.path();
-        if p.is_dir() && keep.is_none_or(|k| !k.starts_with(&p)) {
-            prune_empty_dirs(&p, keep);
+        prune_empty_dirs_at(&p, keep, depth + 1);
+        if keep.is_none_or(|k| !k.starts_with(&p)) {
             let _ = std::fs::remove_dir(&p);
-        } else if p.is_dir() {
-            prune_empty_dirs(&p, keep);
         }
     }
 }
