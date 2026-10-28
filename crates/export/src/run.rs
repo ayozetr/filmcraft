@@ -68,7 +68,51 @@ fn capped_pool(max_threads: u32) -> Option<rayon::ThreadPool> {
 
 /// Run an export (blocking; call from a worker thread). With `settings.max_threads` set it runs on
 /// a pool of that many threads, so its rendering and software encoding use at most that many cores.
+///
+/// A single file on disk is rendered next to its destination and takes the destination's name only
+/// once it is complete, so a failed or cancelled export leaves any earlier file at that path as it
+/// was (#2793).
 pub fn export(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, sources: &dyn SourceProvider, progress: &Progress) -> Result<Report> {
+    let Some(staged) = staging_path(settings) else { return export_pooled(project, seq, settings, sources, progress) };
+    let mut staging = settings.clone();
+    staging.path = staged.clone();
+    match export_pooled(project, seq, &staging, sources, progress) {
+        Ok(mut report) => {
+            if let Err(e) = std::fs::rename(&staged, &settings.path) {
+                return Err(ExportError::Io(format!("{}: {e} (the finished export is in {staged})", settings.path)));
+            }
+            report.path = settings.path.clone();
+            Ok(report)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&staged);
+            Err(e)
+        }
+    }
+}
+
+/// Where an export to one file on disk is rendered before it takes the destination's name: a hidden
+/// file next to it, with the same extension (the AAC writer chooses ADTS by it). None when the output
+/// goes to a sink or an already opened file, or is several files (image sequences, MXF OP-Atom).
+fn staging_path(settings: &ExportSettings) -> Option<String> {
+    if cfg!(target_arch = "wasm32")
+        || settings.sink.is_some()
+        || settings.output_file.is_some()
+        || settings.format.is_image_sequence()
+        || settings.format == Format::MxfOpAtom
+    {
+        return None;
+    }
+    let path = std::path::Path::new(&settings.path);
+    let name = path.file_name()?.to_str()?;
+    let staged = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => format!(".{stem}.part.{ext}"),
+        _ => format!(".{name}.part"),
+    };
+    Some(path.with_file_name(staged).to_string_lossy().into_owned())
+}
+
+fn export_pooled(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, sources: &dyn SourceProvider, progress: &Progress) -> Result<Report> {
     match capped_pool(settings.max_threads) {
         Some(pool) => pool.install(|| export_here(project, seq, settings, sources, progress)),
         None => export_here(project, seq, settings, sources, progress),
