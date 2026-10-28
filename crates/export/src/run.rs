@@ -74,6 +74,8 @@ fn capped_pool(max_threads: u32) -> Option<rayon::ThreadPool> {
 /// was (#2793).
 pub fn export(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, sources: &dyn SourceProvider, progress: &Progress) -> Result<Report> {
     let Some((staged, file)) = reserve_staging(settings)? else { return export_pooled(project, seq, settings, sources, progress) };
+    // declared before `staging`, so the reserved file is closed before the guard removes it
+    let mut guard = StagingGuard { path: staged.clone(), progress, armed: true };
     let mut staging = settings.clone();
     staging.path = staged.clone();
     staging.output_file = Some(Arc::new(file));
@@ -82,20 +84,33 @@ pub fn export(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, so
     progress.staged.store(false, Ordering::Relaxed);
     // the reserved file is closed before it is renamed or removed (Windows can't rename it open)
     drop(staging);
-    match result {
-        Ok(mut report) => {
-            if let Err(e) = std::fs::rename(&staged, &settings.path) {
-                return Err(ExportError::Io(format!("{}: {e} (the finished export is in {staged})", settings.path)));
-            }
-            report.path = settings.path.clone();
-            if !settings.part_of_batch {
-                progress.set_done(report.seconds);
-            }
-            Ok(report)
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&staged);
-            Err(e)
+    let mut report = result?;
+    let renamed = std::fs::rename(&staged, &settings.path);
+    // a failed rename keeps the finished file the error points to
+    guard.armed = false;
+    if let Err(e) = renamed {
+        return Err(ExportError::Io(format!("{}: {e} (the finished export is in {staged})", settings.path)));
+    }
+    report.path = settings.path.clone();
+    if !settings.part_of_batch {
+        progress.set_done(report.seconds);
+    }
+    Ok(report)
+}
+
+/// Cleans up a staged export that didn't reach its rename, on an error or a panic alike: the
+/// staging file is removed and `finished` is no longer held back.
+struct StagingGuard<'a> {
+    path: String,
+    progress: &'a Progress,
+    armed: bool,
+}
+
+impl Drop for StagingGuard<'_> {
+    fn drop(&mut self) {
+        self.progress.staged.store(false, Ordering::Relaxed);
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
         }
     }
 }

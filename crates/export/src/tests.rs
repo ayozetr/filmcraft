@@ -102,6 +102,20 @@ fn an_export_replaces_its_destination_only_once_complete() {
     assert!(std::fs::read(&path).unwrap() == b"earlier export", "the cancelled export changed the earlier file");
     assert_eq!(files(), ["out.mov"]);
 
+    // a panic while writing (a worker's, which rayon passes on) cleans up the same way
+    let panicked = Progress::default();
+    let panic_once_writing = |item| {
+        if files() != ["out.mov"] {
+            panic!("a source failed while the export was writing");
+        }
+        m.source(item)
+    };
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| export(&p, seq, &s, &panic_once_writing, &panicked)));
+    assert!(caught.is_err());
+    assert!(std::fs::read(&path).unwrap() == b"earlier export", "the panicked export changed the earlier file");
+    assert_eq!(files(), ["out.mov"], "the panicked export left its staging file");
+    assert!(!panicked.staged.load(Ordering::Relaxed), "finished is still held back");
+
     // finished only once the destination is the new file (the UI and Quick Export read it so)
     let done = Progress::default();
     let r = std::thread::scope(|t| {

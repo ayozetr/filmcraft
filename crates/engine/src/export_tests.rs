@@ -113,9 +113,26 @@ fn an_export_over_the_projects_own_media_is_refused() {
     let frame = dir.path("shot001.png");
     s.execute("file.import", json!({"paths": [frame]})).unwrap();
     let before = std::fs::read(&frame).unwrap();
-    let e = s.execute("file.exportMedia", frames).unwrap_err().to_string();
+    let e = s.execute("file.exportMedia", frames.clone()).unwrap_err().to_string();
     assert!(e.contains("media of"), "{e}");
     assert!(std::fs::read(&frame).unwrap() == before, "the frame changed");
+    // the same name in other case is the same file only where the file system says so
+    // (macOS, Windows), and is refused exactly there
+    let case_blind = Path::new(&dir.path("SHOT001.PNG")).exists();
+    frames["path"] = json!(dir.path("Shot.png"));
+    let r = s.execute("file.exportMedia", frames.clone());
+    assert_eq!(r.is_err(), case_blind, "{r:?}");
+    assert!(std::fs::read(&frame).unwrap() == before, "the frame changed");
+    // so is a frame name that leads to the media another way: here a link the export would
+    // write through
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&frame, dir.path("Take001.png")).unwrap();
+        frames["path"] = json!(dir.path("Take.png"));
+        let e = s.execute("file.exportMedia", frames).unwrap_err().to_string();
+        assert!(e.contains("media of"), "{e}");
+        assert!(std::fs::read(&frame).unwrap() == before, "the frame changed");
+    }
 }
 
 /// A scratch directory under the workspace `target/`, removed when dropped.

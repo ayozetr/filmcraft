@@ -539,16 +539,23 @@ fn media_at(project: &Project, settings: &ExportSettings) -> Option<String> {
     let target = std::fs::canonicalize(dest).ok();
     let stem = dest.file_stem()?.to_str()?;
     let ext = dest.extension().and_then(|e| e.to_str()).unwrap_or("png");
-    let digits = |n: &str, min: usize| n.len() >= min && n.bytes().all(|b| b.is_ascii_digit());
+    // A media file named like an output (a number, then `suffix`, any case) stands for the path the
+    // export gives that number; the two are compared canonically, so a case-insensitive file system
+    // matches `Shot001.png` to `shot001.png` and a case-sensitive one keeps them apart.
+    let generated = |name: &str, file: &Path, infix: &str, suffix: &str, min: usize| {
+        let cut = name.len().saturating_sub(suffix.len());
+        let (Some(head), Some(tail)) = (name.get(..cut), name.get(cut..)) else { return false };
+        let Some(n) = head.get(head.trim_end_matches(|c: char| c.is_ascii_digit()).len()..) else { return false };
+        tail.eq_ignore_ascii_case(suffix) && n.len() >= min && std::fs::canonicalize(dir.join(format!("{stem}{infix}{n}{suffix}"))).is_ok_and(|c| c == file)
+    };
     let written = |file: &Path| {
         if target.as_deref() == Some(file) {
             return true;
         }
         let Some(name) = file.file_name().and_then(|n| n.to_str()).filter(|_| file.parent() == Some(dir.as_path())) else { return false };
-        let rest = name.strip_prefix(stem);
         match settings.format {
-            f if f.is_image_sequence() => rest.and_then(|r| r.strip_suffix(ext)?.strip_suffix('.')).is_some_and(|n| digits(n, 3)),
-            Format::MxfOpAtom => rest.and_then(|r| r.strip_prefix("_A")?.strip_suffix(".mxf")).is_some_and(|n| digits(n, 1)),
+            f if f.is_image_sequence() => generated(name, file, "", &format!(".{ext}"), 3),
+            Format::MxfOpAtom => generated(name, file, "_A", ".mxf", 1),
             _ => false,
         }
     };
